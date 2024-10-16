@@ -403,9 +403,8 @@ class BaselineReceiver(nn.Module):
         # llr_est #(64, 1, 1, 4256)
 
         b_hat = hard_decisions(llr_est, np.int32)
-        BER = calculate_BER(b, b_hat)
-        print("BER Value:", BER)
-        return b_hat, BER
+      
+        return b_hat
 
 
 def calculate_BER(bits, bits_est):
@@ -477,10 +476,11 @@ if __name__ == "__main__":
     # channeltype="perfect", "awgn", "ofdm", "time"
     y, h_out, b, no = transmit(ebno_db=5.0, channeltype="ofdm", perfect_csi=False)
     # Receive signal
-    b_hat1, berr1 = baseline_receiver(y, h_out, no)
+    b_hat1= baseline_receiver(y, h_out, no)
 
     # Print baseline receiver evaluation parameters
     print("Baseline Receiver output Parameters:")
+    berr1 = calculate_BER(b, b_hat1)
 
     print("b:", b)
     print("b_hat:", b_hat1)

@@ -1,8 +1,10 @@
+import torch.nn as nn
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
-from MYSetup.helperLibrary import (
+from helperLibrary import (
+    hard_decisions,
     StreamManagement,
     MyResourceGrid,
     Mapper,
@@ -19,21 +21,20 @@ from MYSetup.helperLibrary import (
     complex_normal,
     time_lag_discrete_time_channel,
     cir_to_time_channel,
-    hard_decisions,
-    calculate_BER,
 )
 
 from sionna_tf import (
     MyLMMSEEqualizer,
-)  # , OFDMDemodulator #ZFPrecoder, OFDMModulator, KroneckerPilotPattern, Demapper, RemoveNulledSubcarriers,
+)
 from channel import (
     LSChannelEstimator,
 )  # , time_lag_discrete_time_channel #, ApplyTimeChannel #cir_to_time_channel
 
 from Encode_Decode.ldpc import LDPC5GDecoder, LDPC5GEncoder
+from NR_Receiver import NeuralReceiver
 
 
-class Transmitter:
+class Transmitter(nn.Module):
     def __init__(
         self,
         num_rx=1,
@@ -68,6 +69,8 @@ class Transmitter:
         )
 
         h, tau = next(iter(self.data_loader))  # Get the first batch of random channels
+        #         h shape: torch.Size([64, 1, 1, 1, 16, 10, 1])
+        # tau shape: torch.Size([64, 1, 1, 10])
         print("h shape:", h.shape)
         print("tau shape:", tau.shape)
 
@@ -347,21 +350,14 @@ class Transmitter:
             b = binary_source(
                 [self.batch_size, 1, self.num_streams_per_tx, self.k]
             )  # [64,1,1,3584] if empty [64,1,1,1536] [batch_size, num_tx, num_streams_per_tx, num_databits]
-        if self.USE_LDPC:
-            c = self.encoder(
-                b
-            )  # tf.tensor[64,1,1,3072] [batch_size, num_tx, num_streams_per_tx, num_codewords]
-        else:
-            c = b
+        c = self.encoder(b) if self.USE_LDPC else b
         x = self.mapper(
             c
         )  # np.array[64,1,1,896] if empty np.array[64,1,1,1064] 1064*4=4256 [batch_size, num_tx, num_streams_per_tx, num_data_symbols]
         x_rg = self.rg_mapper(x)  ##complex array[64,1,1,14,76] 14*76=1064
         # output: [batch_size, num_tx, num_streams_per_tx, num_ofdm_symbols, fft_size][64,1,1,14,76]
 
-        # set noise level
-        ebnorange = np.linspace(-7, -5.25, 10)
-        # ebno_db = 15.0
+        ebno_db = 15.0
         # no = ebnodb2no(ebno_db, num_bits_per_symbol, coderate, RESOURCE_GRID)
         no = ebnodb2no(ebno_db, self.num_bits_per_symbol, self.coderate)
         # Convert it to a NumPy float
@@ -370,328 +366,67 @@ class Transmitter:
         y, h_out = self.generateChannel(x_rg, no, channeltype=channeltype)
         # y is the symbol received after the channel and noise
         # Channel outputs y : [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], complex
-        print(
-            y.shape
-        )  # [64, 1, 1, 14, 76] dim (3,4 removed) h_out: (64, 1, 1, 1, 16, 1, 44)
-        # print(y.real)
-        # print(y.imag)
-        print("Y:", type(y))
-        print("Y shape:", y.shape)
-        print("hout:", type(h_out))
-        print("hout shape:", h_out.shape)
-        print("b:", type(b))
-        print("b shape:", b.shape)
-        print(
-            self.RESOURCE_GRID.pilot_pattern
-        )  # <__main__.EmptyPilotPattern object at 0x7f2659dfd9c0>
-        if (
-            self.pilot_pattern == "empty" and perfect_csi == False
-        ):  # "kronecker", "empty"
-            # no channel estimation
-            llr = self.mydemapper([y, no])  # [64, 1, 1, 14, 304]
-            # Reshape the array by collapsing the last two dimensions
-            llr_est = llr.reshape(llr.shape[:-2] + (-1,))  # (64, 1, 1, 4256)
+        y = np.array(y)
+        h_out = np.array(h_out)
+        print("no:", no)
+        return y, h_out, b, no
 
-            llr_perfect = self.mydemapper([x_rg, no])  # [64, 1, 1, 14, 304]
-            llr_perfect = llr_perfect.reshape(
-                llr_perfect.shape[:-2] + (-1,)
-            )  # (64, 1, 1, 4256)
-            b_perfect = hard_decisions(
-                llr_perfect, np.int32
-            )  ##(64, 1, 1, 4256) 0,1 [64, 1, 1, 14, 304] 2128
-            # BER=calculate_BER(b, b_perfect)
-            # print("Perfect BER:", BER)
-        else:  # channel estimation or perfect_csi
-            if perfect_csi == True:
-                # For perfect CSI, the receiver gets the channel frequency response as input
-                # However, the channel estimator only computes estimates on the non-nulled
-                # subcarriers. Therefore, we need to remove them here from `h_freq` (done inside the self.generateChannel).
-                # This step can be skipped if no subcarriers are nulled.
-                h_hat, err_var = h_out, 0.0  # (64, 1, 1, 1, 16, 1, 64)
-            else:  # perform channel estimation via pilots
-                print(
-                    "Num of Pilots:", len(self.RESOURCE_GRID.pilot_pattern.pilots)
-                )  # 1
-                # Receiver
-                ls_est = LSChannelEstimator(
-                    self.RESOURCE_GRID, interpolation_type="lin_time_avg"
-                )
-                # ls_est = MyLSChannelEstimator(self.RESOURCE_GRID, interpolation_type="lin_time_avg")
 
-                # Observed resource grid y : [batch_size, num_rx, num_rx_ant, num_ofdm_symbols,fft_size], (64, 1, 1, 14, 76) complex
-                # no : [batch_size, num_rx, num_rx_ant]
-                print("no shape:", no.shape)
-                print("y shape:", y.shape)
-                print(no)
-                h_hat, err_var = ls_est(
-                    [y, no]
-                )  # tf tensor (64, 1, 1, 1, 1, 14, 64), (1, 1, 1, 1, 1, 14, 64)
-                # h_ls : [batch_size, num_rx, num_rx_ant, num_tx, num_streams_per_tx, num_ofdm_symbols,fft_size], tf.complex
-                # Channel estimates accross the entire resource grid for all transmitters and streams
+class BaselineReceiver(nn.Module):
+    """Baseline receiver with LS channel estimation and LMMSE equalization."""
 
-            if self.showfig:
-                h_perfect = h_out[0, 0, 0, 0, 0, 0]  # (64, 1, 1, 1, 16, 1, 44)
-                h_est = h_hat[0, 0, 0, 0, 0, 0]  # (64, 1, 1, 1, 1, 14, 44)
-                plt.figure()
-                plt.plot(np.real(h_perfect))
-                plt.plot(np.imag(h_perfect))
-                plt.plot(np.real(h_est), "--")
-                plt.plot(np.imag(h_est), "--")
-                plt.xlabel("Subcarrier index")
-                plt.ylabel("Channel frequency response")
-                plt.legend(
-                    [
-                        "Ideal (real part)",
-                        "Ideal (imaginary part)",
-                        "Estimated (real part)",
-                        "Estimated (imaginary part)",
-                    ]
-                )
-                plt.title("Comparison of channel frequency responses")
+    def __init__(self, resource_grid, stream_management, demapper):
+        self.resource_grid = resource_grid
+        self.stream_management = stream_management
+        self.demapper = demapper
 
-            # lmmse_equ = LMMSEEqualizer(self.RESOURCE_GRID, self.STREAM_MANAGEMENT)
-            lmmse_equ = MyLMMSEEqualizer(self.RESOURCE_GRID, self.STREAM_MANAGEMENT)
-            # input (y, h_hat, err_var, no)
-            # Received OFDM resource grid after cyclic prefix removal and FFT y : [batch_size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], tf.complex
-            # Channel estimates for all streams from all transmitters h_hat : [batch_size, num_rx, num_rx_ant, num_tx, num_streams_per_tx, num_ofdm_symbols, num_effective_subcarriers], tf.complex
-            x_hat, no_eff = lmmse_equ(
-                [y, h_hat, err_var, no]
-            )  # (64, 1, 1, 912), (64, 1, 1, 912)
-            # Estimated symbols x_hat : [batch_size, num_tx, num_streams, num_data_symbols], tf.complex
-            # Effective noise variance for each estimated symbol no_eff : [batch_size, num_tx, num_streams, num_data_symbols], tf.float
-            x_hat = x_hat.numpy()  # (64, 1, 1, 912)
-            no_eff = no_eff.numpy()  # (64, 1, 1, 912)
-            no_eff = np.mean(no_eff)
-
-            llr_est = self.mydemapper([x_hat, no_eff])  # (64, 1, 1, 3072)
-            # output: [batch size, num_rx, num_rx_ant, n * num_bits_per_symbol]
-
-        # llr_est #(64, 1, 1, 4256)
-        if self.USE_LDPC:
-            b_hat_tf = self.decoder(llr_est)  # [64, 1, 1, 2128]
-            b_hat = b_hat_tf.numpy()
+    def __call__(self, y, h_out, no, perfect_csi=False):
+        if perfect_csi:
+            h_hat, err_var = h_out, 0.0
         else:
-            b_hat = hard_decisions(llr_est, np.int32)
+            ls_est = LSChannelEstimator(
+                self.resource_grid, interpolation_type="lin_time_avg"
+            )
+            y = np.array(y)
+            no = np.array(no)
+            print("y shape:", y.shape, "ytype:", type(y))
+            print("no shape:", no.shape, "notype:", type(no))
+            h_hat, err_var = ls_est([y, no])
+
+        lmmse_equ = MyLMMSEEqualizer(self.resource_grid, self.stream_management)
+        x_hat, no_eff = lmmse_equ([y, h_hat, err_var, no])
+        x_hat = x_hat.numpy()  # (64, 1, 1, 912)
+        no_eff = no_eff.numpy()  # (64, 1, 1, 912)
+        no_eff = np.mean(no_eff)
+
+        llr_est = self.demapper([x_hat, no_eff])
+        # llr_est #(64, 1, 1, 4256)
+
+        b_hat = hard_decisions(llr_est, np.int32)
         BER = calculate_BER(b, b_hat)
         print("BER Value:", BER)
         return b_hat, BER
 
 
-# def get_deepMIMOdata(
-#     scenario="O1_60",
-#     # dataset_folder=r"D:\Dataset\CommunicationDataset\O1_60",
-#     dataset_folder=r"D:\Research\neural_receiver\MYSetup\O1_60",
-#     num_ue_antenna=1,
-#     num_bs_antenna=16,
-#     showfig=True,
-# ):
-#     # Load the default parameters
-#     print("Loading DeepMIMO parameters...")
-#     print(dataset_folder)
-#     parameters = DeepMIMO.default_params()
-#     # https://github.com/DeepMIMO/DeepMIMO-python/blob/master/src/DeepMIMOv3/params.py
-#     # Set scenario name
-#     parameters["scenario"] = scenario  # https://deepmimo.net/scenarios/o1-scenario/
+def calculate_BER(bits, bits_est):
+    errors = (bits != bits_est).sum()
+    N = len(bits.flatten())
+    BER = 1.0 * errors / N
 
-#     # Set the main folder containing extracted scenarios
-#     parameters["dataset_folder"] = (
-#         dataset_folder  # r'D:\Dataset\CommunicationDataset\O1_60'
-#     )
+    return BER
 
-#     # To only include 10 strongest paths in the channel computation, num_paths integer in [1, 25]
-#     parameters["num_paths"] = 10
 
-#     # To activate only the first basestation, set
-#     parameters["active_BS"] = np.array(
-#         [1]
-#     )  # Basestation indices to be included in the dataset
-#     # parameters['active_BS'] = np.array([1, 5, 8]) #enable multiple basestations
-#     # To activate the basestations 6, set
-#     # parameters['active_BS'] = np.array([6])
+def calculate_BER2(bits, bits_est):
+    # Ensure both arrays have the same shape
+    min_length = min(bits.size, bits_est.size)
+    bits = bits.flatten()[:min_length]
+    bits_est = bits_est.flatten()[:min_length]
 
-#     parameters["OFDM"]["bandwidth"] = 0.05  # 50 MHz
-#     print(parameters["OFDM"]["subcarriers"])  # 512
-#     # parameters['OFDM']['subcarriers'] = 512 # OFDM with 512 subcarriers
-#     # parameters['OFDM']['subcarriers_limit'] = 64 # Keep only first 64 subcarriers
+    errors = (bits != bits_est).sum()
+    N = len(bits)
+    BER = 1.0 * errors / N
 
-#     # To activate the user rows 1-5, set
-#     parameters["user_row_first"] = (
-#         1  # 400 # First user row to be included in the dataset
-#     )
-#     parameters["user_row_last"] = (
-#         100  # 450 # Last user row to be included in the dataset
-#     )
-
-#     # Configuration of the antenna arrays
-#     parameters["bs_antenna"]["shape"] = np.array(
-#         [num_bs_antenna, 1, 1]
-#     )  # BS antenna shape through [x, y, z] axes
-#     parameters["ue_antenna"]["shape"] = np.array(
-#         [num_ue_antenna, 1, 1]
-#     )  # UE antenna shape through [x, y, z] axes, single antenna
-
-#     # The OFDM_channels parameter allows choosing between the generation of channel impulse
-#     # responses (if set to 0) or frequency domain channels (if set to 1).
-#     # It is set to 0 for this simulation, as the channel responses in frequency domain will be generated
-#     parameters["OFDM_channels"] = 0
-
-#     # Generate data
-#     DeepMIMO_dataset = DeepMIMO.generate_data(parameters)
-
-#     ## User locations
-#     active_bs_idx = 0  # Select the first active basestation in the dataset
-#     print(
-#         DeepMIMO_dataset[active_bs_idx]["user"].keys()
-#     )  # ['paths', 'LoS', 'location', 'distance', 'pathloss', 'channel']
-#     print(
-#         DeepMIMO_dataset[active_bs_idx]["user"]["location"].shape
-#     )  # (9231, 3)  num_ue_locations: 9231
-#     j = 0  # user j
-#     print(
-#         DeepMIMO_dataset[active_bs_idx]["user"]["location"][j]
-#     )  # The Euclidian location of the user in the form of [x, y, z].
-
-#     # Number of basestations
-#     print(len(DeepMIMO_dataset))  # 1
-#     # Keys of a basestation dictionary
-#     print(DeepMIMO_dataset[0].keys())  # ['user', 'basestation', 'location']
-#     # Keys of a channel
-#     print(
-#         DeepMIMO_dataset[0]["user"].keys()
-#     )  # ['paths', 'LoS', 'location', 'distance', 'pathloss', 'channel']
-#     # Number of UEs
-#     print(len(DeepMIMO_dataset[0]["user"]["channel"]))  # 9231 18100
-#     print(
-#         DeepMIMO_dataset[active_bs_idx]["user"]["channel"].shape
-#     )  # (num_ue_locations=18100, 1, bs_antenna=16, strongest_path=10)
-#     # Shape of the channel matrix
-#     print(DeepMIMO_dataset[0]["user"]["channel"].shape)  # (18100, 1, 16, 10)
-#     # i=0
-#     j = 0
-#     print(DeepMIMO_dataset[active_bs_idx]["user"]["channel"][j])
-#     # Float matrix of size (number of RX antennas) x (number of TX antennas) x (number of OFDM subcarriers)
-#     # The channel matrix between basestation i and user j, Shape of BS 0 - UE 0 channel
-#     print(DeepMIMO_dataset[active_bs_idx]["user"]["channel"][j].shape)  # (1, 16, 10)
-
-#     # Path properties of BS 0 - UE 0
-#     print(
-#         DeepMIMO_dataset[active_bs_idx]["user"]["paths"][j]
-#     )  # Ray-tracing Path Parameters in dictionary
-#     #'num_paths': 9, Azimuth and zenith angle-of-arrivals – degrees (DoA_phi, DoA_theta), size of 9 array
-#     # Azimuth and zenith angle-of-departure – degrees (DoD_phi, DoD_theta)
-#     # Time of arrival – seconds (ToA)
-#     # Phase – degrees (phase)
-#     # Power – watts (power)
-#     # Number of paths (num_paths)
-
-#     print(
-#         DeepMIMO_dataset[active_bs_idx]["user"]["LoS"][j]
-#     )  # Integer of values {-1, 0, 1} indicates the existence of the LOS path in the channel.
-#     # (1): The LoS path exists.
-#     # (0): Only NLoS paths exist. The LoS path is blocked (LoS blockage).
-#     # (-1): No paths exist between the transmitter and the receiver (Full blockage).
-
-#     print(DeepMIMO_dataset[active_bs_idx]["user"]["distance"][j])
-#     # The Euclidian distance between the RX and TX locations in meters.
-
-#     print(DeepMIMO_dataset[active_bs_idx]["user"]["pathloss"][j])
-#     # The combined path-loss of the channel between the RX and TX in dB.
-
-#     print(DeepMIMO_dataset[active_bs_idx]["location"])
-#     # Basestation Location [x, y, z].
-#     print(DeepMIMO_dataset[active_bs_idx]["user"]["location"][j])
-#     # The Euclidian location of the user in the form of [x, y, z].
-
-#     # https://github.com/DeepMIMO/DeepMIMO-python/blob/master/src/DeepMIMOv3/sionna_adapter.py
-
-#     if showfig:
-#         plt.figure(figsize=(12, 8))
-#         plt.scatter(
-#             DeepMIMO_dataset[active_bs_idx]["user"]["location"][
-#                 :, 1
-#             ],  # y-axis location of the users
-#             DeepMIMO_dataset[active_bs_idx]["user"]["location"][
-#                 :, 0
-#             ],  # x-axis location of the users
-#             s=1,
-#             marker="x",
-#             c="C0",
-#             label="The users located on the rows %i to %i (R%i to R%i)"
-#             % (
-#                 parameters["user_row_first"],
-#                 parameters["user_row_last"],
-#                 parameters["user_row_first"],
-#                 parameters["user_row_last"],
-#             ),
-#         )  # 1-100
-#         # First 181 users correspond to the first row
-#         plt.scatter(
-#             DeepMIMO_dataset[active_bs_idx]["user"]["location"][0:181, 1],
-#             DeepMIMO_dataset[active_bs_idx]["user"]["location"][0:181, 0],
-#             s=1,
-#             marker="x",
-#             c="C1",
-#             label="First row of users (R%i)" % (parameters["user_row_first"]),
-#         )
-
-#         ## Basestation location
-#         plt.scatter(
-#             DeepMIMO_dataset[active_bs_idx]["location"][1],
-#             DeepMIMO_dataset[active_bs_idx]["location"][0],
-#             s=50.0,
-#             marker="o",
-#             c="C2",
-#             label="Basestation",
-#         )
-
-#         plt.gca().invert_xaxis()  # Invert the x-axis to align the figure with the figure above
-#         plt.ylabel("x-axis")
-#         plt.xlabel("y-axis")
-#         plt.grid()
-#         plt.legend()
-
-#         dataset = DeepMIMO_dataset
-#         ## Visualization of a channel matrix
-#         plt.figure()
-#         # Visualize channel magnitude response
-#         # First, select indices of a user and bs
-#         ue_idx = 0
-#         bs_idx = 0
-#         # Import channel
-#         channel = dataset[bs_idx]["user"]["channel"][ue_idx]
-#         # Take only the first antenna pair
-#         # plt.imshow(np.abs(np.squeeze(channel).T))
-#         # plt.title('Channel Magnitude Response')
-#         # plt.xlabel('TX Antennas')
-#         # plt.ylabel('Subcarriers')
-
-#         ## Visualization of the UE positions and path-losses
-#         loc_x = dataset[bs_idx]["user"]["location"][:, 0]  # (9231,)
-#         loc_y = dataset[bs_idx]["user"]["location"][:, 1]
-#         loc_z = dataset[bs_idx]["user"]["location"][:, 2]
-#         pathloss = dataset[bs_idx]["user"]["pathloss"]  # (9231,
-#         fig = plt.figure()
-#         ax = fig.add_subplot(projection="3d")
-#         im = ax.scatter(loc_x, loc_y, loc_z, c=pathloss)
-#         ax.set_xlabel("x (m)")
-#         ax.set_ylabel("y (m)")
-#         ax.set_zlabel("z (m)")
-
-#         bs_loc_x = dataset[bs_idx]["basestation"]["location"][:, 0]
-#         bs_loc_y = dataset[bs_idx]["basestation"]["location"][:, 1]
-#         bs_loc_z = dataset[bs_idx]["basestation"]["location"][:, 2]
-#         ax.scatter(bs_loc_x, bs_loc_y, bs_loc_z, c="r")
-#         ttl = plt.title("UE and BS Positions")
-
-#         fig = plt.figure()
-#         ax = fig.add_subplot()
-#         im = ax.scatter(loc_x, loc_y, c=pathloss)
-#         ax.set_xlabel("x (m)")
-#         ax.set_ylabel("y (m)")
-#         fig.colorbar(im, ax=ax)
-#         ttl = plt.title("UE Grid Path-loss (dB)")
-
-#     return DeepMIMO_dataset
+    return BER
 
 
 class RandomChannelDataset(Dataset):
@@ -733,7 +468,40 @@ if __name__ == "__main__":
         guards=True,
         showfig=showfigure,
     )  # "kronecker" "empty"
+    # Receiver
+    baseline_receiver = BaselineReceiver(
+        resource_grid=transmit.RESOURCE_GRID,
+        stream_management=transmit.STREAM_MANAGEMENT,
+        demapper=transmit.mydemapper,
+    )
     # channeltype="perfect", "awgn", "ofdm", "time"
-    b_hat, BER = transmit(ebno_db=5.0, channeltype="ofdm", perfect_csi=False)
+    y, h_out, b, no = transmit(ebno_db=5.0, channeltype="ofdm", perfect_csi=False)
+    # Receive signal
+    b_hat1, berr1 = baseline_receiver(y, h_out, no)
 
-    print("Finished")
+    # Print baseline receiver evaluation parameters
+    print("Baseline Receiver output Parameters:")
+
+    print("b:", b)
+    print("b_hat:", b_hat1)
+    print("BER:", berr1)
+
+    # Instantiate the neural receiver
+    neural_receiver = NeuralReceiver(
+        resource_grid=transmit.RESOURCE_GRID,
+        stream_management=transmit.STREAM_MANAGEMENT,
+        num_bits_per_symbol=transmit.num_bits_per_symbol,
+        num_rx_ant=1,
+        num_tx=1,
+    )
+
+    # Neural Receiver processing
+    b_hat2 = neural_receiver(y, no)
+    print("neural_receiver output:")
+    # Calculate BER
+    print("b", b.shape)
+
+    print("Estimated Bits (b_hat):", b_hat2.shape)
+    berr2 = calculate_BER(b, b_hat2)
+    print("Bit Error Rate (BER):", berr2)
+    print("Transmitter and Receiver test passed!")
