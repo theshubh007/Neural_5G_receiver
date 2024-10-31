@@ -476,7 +476,7 @@ if __name__ == "__main__":
     # channeltype="perfect", "awgn", "ofdm", "time"
     y, h_out, b, no = transmit(ebno_db=5.0, channeltype="ofdm", perfect_csi=False)
     # Receive signal
-    b_hat1= baseline_receiver(y, h_out, no)
+   
 
     # Print baseline receiver evaluation parameters
     print("Baseline Receiver output Parameters:")
